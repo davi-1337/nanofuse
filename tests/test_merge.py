@@ -1,4 +1,9 @@
+import os
+import sys
 import torch
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+
 import merger
 import utils
 
