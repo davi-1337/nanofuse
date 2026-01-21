@@ -111,7 +111,17 @@ def apply_dare(delta: torch.Tensor, drop_rate: float) -> torch.Tensor:
     if drop_rate >= 1:
         return torch.zeros_like(delta)
     flat = delta.abs().flatten()
-    threshold = torch.quantile(flat, drop_rate)
+    sample_size = min(flat.numel(), 1_000_000)
+    if sample_size < flat.numel():
+        idx = torch.randint(0, flat.numel(), (sample_size,), device=flat.device)
+        sample = flat[idx]
+    else:
+        sample = flat
+    try:
+        threshold = torch.quantile(sample, drop_rate)
+    except RuntimeError:
+        kth = max(1, int(drop_rate * sample.numel()))
+        threshold = torch.kthvalue(sample, kth).values
     mask = (delta.abs() >= threshold).to(delta.dtype)
     scale = 1.0 / (1.0 - drop_rate)
     return delta * mask * scale
