@@ -11,7 +11,12 @@ app = typer.Typer(no_args_is_help=True)
 @app.command()
 def merge(
     base: str = typer.Option(..., "--base", help="Base model id or path"),
-    models: list[str] = typer.Option(..., "--models", nargs=-1, help="Model ids"),
+    models: list[str] | None = typer.Option(
+        None, "--model", "-m", help="Model id (repeat per model)"
+    ),
+    models_csv: str | None = typer.Option(
+        None, "--models", help="Comma-separated model ids"
+    ),
     rank: int = typer.Option(128, "--rank", help="Low-rank dimension"),
     output: str = typer.Option(..., "--output", help="Output directory"),
     quant: str = typer.Option("q4", "--quant", help="Quantization mode"),
@@ -36,9 +41,14 @@ def merge(
     device = device.lower()
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    selected = list(models or [])
+    if models_csv:
+        selected.extend([m.strip() for m in models_csv.split(",") if m.strip()])
+    if not selected:
+        raise typer.BadParameter("At least one model id is required")
     merger.merge(
         base_id=base,
-        model_ids=list(models),
+        model_ids=selected,
         rank=rank,
         output=output,
         quant=quant,
