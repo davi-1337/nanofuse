@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,10 @@ def _calib_samples(
     return samples
 
 
+def _prepare_transformers_env() -> None:
+    os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
+
+
 def quantize_gptq(
     model_dir: str,
     tokenizer: Any,
@@ -61,6 +66,7 @@ def quantize_gptq(
     dataset_name: str = "wikitext",
     dataset_config: str = "wikitext-2-raw-v1",
 ) -> str:
+    _prepare_transformers_env()
     from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
 
     out = Path(output_dir)
@@ -82,6 +88,7 @@ def quantize_gptq(
 
 
 def quantize_awq(model_dir: str, tokenizer: Any, output_dir: str) -> str:
+    _prepare_transformers_env()
     from awq import AutoAWQForCausalLM
 
     out = Path(output_dir)
