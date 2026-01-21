@@ -5,6 +5,8 @@ import subprocess
 import sys
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
+import math
+import re
 from pathlib import Path
 from typing import Callable, Sequence, TypeAlias, TypeVar
 
@@ -222,6 +224,130 @@ def select_rank(
     cumulative = torch.cumsum(energy, dim=0) / total
     target = int((cumulative >= energy_threshold).nonzero(as_tuple=False)[0].item() + 1)
     return max(min_rank, min(max_rank, target))
+
+
+def parse_layers_filter(value: str | None) -> LayerFilter:
+    if value is None or value.strip() == "":
+        return None, None
+    normalized = value.strip()
+    if re.fullmatch(r"[0-9,\-\s]+", normalized):
+        ranges = set()
+        for part in normalized.split(","):
+            chunk = part.strip()
+            if chunk == "":
+                continue
+            if "-" in chunk:
+                start_str, end_str = chunk.split("-", 1)
+                start = int(start_str.strip())
+                end = int(end_str.strip())
+                for idx in range(min(start, end), max(start, end) + 1):
+                    ranges.add(idx)
+            else:
+                ranges.add(int(chunk))
+        return ranges, None
+    return None, re.compile(normalized)
+
+
+def should_merge_key(key: str, layer_id: str, layer_idx: int | None, filt: LayerFilter) -> bool:
+    layer_ranges, pattern = filt
+    if pattern is not None:
+        return pattern.search(key) is not None
+    if layer_ranges is None:
+        return True
+    if layer_idx is None:
+        return False
+    return layer_idx in layer_ranges
+
+
+def evaluate_perplexity(
+    model_dir: str,
+    dataset_name: str,
+    dataset_config: str,
+    split: str,
+    max_samples: int,
+    seq_len: int,
+    device: str,
+    dtype: torch.dtype,
+) -> float:
+    from datasets import load_dataset
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    dataset = load_dataset(dataset_name, dataset_config, split=split)
+    texts = [t for t in dataset["text"] if isinstance(t, str) and t.strip()]
+    texts = texts[:max_samples]
+    if not texts:
+        raise ModelDimensionMismatchError("Perplexity dataset is empty")
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir,
+        torch_dtype=dtype,
+        device_map="auto" if device == "cuda" else None,
+    )
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for text in texts:
+            tokens = tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=seq_len,
+                padding=False,
+            )
+            input_ids = tokens["input_ids"].to(device)
+            outputs = model(input_ids=input_ids, labels=input_ids)
+            losses.append(outputs.loss.detach().float().item())
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    avg_loss = sum(losses) / len(losses)
+    return float(math.exp(avg_loss))
+
+
+def evaluate_lora_perplexity(
+    base_dir: str,
+    lora_dir: str,
+    dataset_name: str,
+    dataset_config: str,
+    split: str,
+    max_samples: int,
+    seq_len: int,
+    device: str,
+    dtype: torch.dtype,
+) -> float:
+    from datasets import load_dataset
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+
+    dataset = load_dataset(dataset_name, dataset_config, split=split)
+    texts = [t for t in dataset["text"] if isinstance(t, str) and t.strip()]
+    texts = texts[:max_samples]
+    if not texts:
+        raise ModelDimensionMismatchError("Perplexity dataset is empty")
+    tokenizer = AutoTokenizer.from_pretrained(base_dir, use_fast=True)
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_dir,
+        torch_dtype=dtype,
+        device_map="auto" if device == "cuda" else None,
+    )
+    model = PeftModel.from_pretrained(base_model, lora_dir)
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for text in texts:
+            tokens = tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=seq_len,
+                padding=False,
+            )
+            input_ids = tokens["input_ids"].to(device)
+            outputs = model(input_ids=input_ids, labels=input_ids)
+            losses.append(outputs.loss.detach().float().item())
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    avg_loss = sum(losses) / len(losses)
+    return float(math.exp(avg_loss))
 
 
 def apply_dare(delta: torch.Tensor, drop_rate: float) -> torch.Tensor:
@@ -526,6 +652,15 @@ def merge(
     mosaic_size: int,
     hadamard_keep: float,
     io_workers: int,
+    mode: str,
+    layers: str | None,
+    quality_gate: bool,
+    ppl_threshold: float,
+    ppl_samples: int,
+    ppl_seq_len: int,
+    ppl_dataset: str,
+    ppl_config: str,
+    ppl_split: str,
     layer_map_path: str | None,
     preflight_threshold: float,
     shard_size_mb: int,
@@ -568,6 +703,16 @@ def merge(
         raise ModelDimensionMismatchError("Hadamard keep ratio must be between 0 and 1")
     if io_workers <= 0:
         raise ModelDimensionMismatchError("I/O workers must be positive")
+    mode_value = mode.lower()
+    if mode_value not in {"merge", "lora", "moe"}:
+        raise ModelDimensionMismatchError("Mode must be merge, lora, or moe")
+    if mode_value == "lora":
+        lora_only = True
+    if mode_value == "moe":
+        lora_only = True
+    if quality_gate and ppl_threshold <= 0:
+        raise ModelDimensionMismatchError("PPL threshold must be positive")
+    layer_filter = parse_layers_filter(layers)
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     if dtype not in dtype_map:
         raise ModelDimensionMismatchError("Dtype must be bf16, fp16, or fp32")
@@ -624,6 +769,7 @@ def merge(
         writer = None if lora_only else ShardWriter(output_dir, max(1, shard_size_mb) * 1024 * 1024)
         lora_tensors: dict[str, torch.Tensor] = {}
         lora_targets: set[str] = set()
+        moe_tensors: list[dict[str, torch.Tensor]] = [{} for _ in range(len(models))]
         conflict_stats: LayerScores = {}
         total_keys = len(base_keys)
         if verbose:
@@ -652,6 +798,10 @@ def merge(
                         if writer:
                             writer.add(key, base_tensor)
                         continue
+                if not should_merge_key(key, layer_id, layer_idx, layer_filter):
+                    if writer:
+                        writer.add(key, base_tensor)
+                    continue
                 if layer_idx is not None and layer_idx in layer_map:
                     selected = [models[layer_map[layer_idx]]]
                 else:
@@ -674,39 +824,21 @@ def merge(
                 conflict = 0.0
                 used_rank = rank
                 try:
-                    fused_delta, conflict, used_rank = compute_fused_delta(
-                        base_tensor,
-                        model_tensors,
-                        rank,
-                        moefrac,
-                        4,
-                        align,
-                        dare_drop,
-                        adaptive_rank,
-                        energy_threshold,
-                        min_rank,
-                        max_rank,
-                        mosaic_size,
-                        hadamard_keep,
-                    )
-                    if writer:
-                        merged = base_tensor + fused_delta
-                except RuntimeError as exc:
-                    if device == "cuda" and "out of memory" in str(exc).lower():
-                        torch.cuda.empty_cache()
-                        device = "cpu"
-                        base_tensor = base.get_tensor(key, device)
-                        if base_tensor.dim() >= 2 and (
-                            is_embedding_key(key) or is_lm_head_key(key)
-                        ):
-                            base_tensor = resize_vocab(base_tensor, new_vocab_size)
-                        model_tensors = [m.get_tensor(key, device) for m in selected]
-                        if base_tensor.dim() >= 2 and (
-                            is_embedding_key(key) or is_lm_head_key(key)
-                        ):
-                            model_tensors = [
-                                resize_vocab(t, new_vocab_size) for t in model_tensors
-                            ]
+                    if mode_value == "moe":
+                        for expert_index, expert_tensor in enumerate(model_tensors):
+                            delta = expert_tensor.float() - base_tensor.float()
+                            delta = apply_dare(delta, dare_drop)
+                            if adaptive_rank:
+                                u, s, v = svd_factors(delta, max_rank)
+                                use_rank = select_rank(s, energy_threshold, min_rank, max_rank)
+                                lora_a, lora_b = lora_decompose(delta, use_rank)
+                            else:
+                                lora_a, lora_b = lora_decompose(delta, lora_rank)
+                            a_key, b_key = lora_keys(key)
+                            moe_tensors[expert_index][a_key] = lora_a.cpu()
+                            moe_tensors[expert_index][b_key] = lora_b.cpu()
+                        fused_delta = torch.zeros_like(base_tensor)
+                    else:
                         fused_delta, conflict, used_rank = compute_fused_delta(
                             base_tensor,
                             model_tensors,
@@ -724,6 +856,56 @@ def merge(
                         )
                         if writer:
                             merged = base_tensor + fused_delta
+                except RuntimeError as exc:
+                    if device == "cuda" and "out of memory" in str(exc).lower():
+                        torch.cuda.empty_cache()
+                        device = "cpu"
+                        base_tensor = base.get_tensor(key, device)
+                        if base_tensor.dim() >= 2 and (
+                            is_embedding_key(key) or is_lm_head_key(key)
+                        ):
+                            base_tensor = resize_vocab(base_tensor, new_vocab_size)
+                        model_tensors = [m.get_tensor(key, device) for m in selected]
+                        if base_tensor.dim() >= 2 and (
+                            is_embedding_key(key) or is_lm_head_key(key)
+                        ):
+                            model_tensors = [
+                                resize_vocab(t, new_vocab_size) for t in model_tensors
+                            ]
+                        if mode_value == "moe":
+                            for expert_index, expert_tensor in enumerate(model_tensors):
+                                delta = expert_tensor.float() - base_tensor.float()
+                                delta = apply_dare(delta, dare_drop)
+                                if adaptive_rank:
+                                    u, s, v = svd_factors(delta, max_rank)
+                                    use_rank = select_rank(
+                                        s, energy_threshold, min_rank, max_rank
+                                    )
+                                    lora_a, lora_b = lora_decompose(delta, use_rank)
+                                else:
+                                    lora_a, lora_b = lora_decompose(delta, lora_rank)
+                                a_key, b_key = lora_keys(key)
+                                moe_tensors[expert_index][a_key] = lora_a.cpu()
+                                moe_tensors[expert_index][b_key] = lora_b.cpu()
+                            fused_delta = torch.zeros_like(base_tensor)
+                        else:
+                            fused_delta, conflict, used_rank = compute_fused_delta(
+                                base_tensor,
+                                model_tensors,
+                                rank,
+                                moefrac,
+                                4,
+                                align,
+                                dare_drop,
+                                adaptive_rank,
+                                energy_threshold,
+                                min_rank,
+                                max_rank,
+                                mosaic_size,
+                                hadamard_keep,
+                            )
+                            if writer:
+                                merged = base_tensor + fused_delta
                     else:
                         raise
                 finally:
@@ -736,7 +918,7 @@ def merge(
                 if report:
                     scores = conflict_stats.setdefault(layer_id, [])
                     scores.append(conflict)
-                if lora_output and base_tensor.dim() == 2:
+                if lora_output and base_tensor.dim() == 2 and mode_value != "moe":
                     lora_effective_rank = min(lora_rank, used_rank)
                     lora_a, lora_b = lora_decompose(fused_delta.float(), lora_effective_rank)
                     a_key, b_key = lora_keys(key)
@@ -753,10 +935,25 @@ def merge(
             writer.finalize()
             if verbose:
                 print("Weights saved.", flush=True)
-        if lora_output:
+        if lora_output and mode_value != "moe":
             save_lora_adapter(Path(lora_output), lora_tensors, base_id, lora_targets, lora_rank)
             if verbose:
                 print("LoRA adapter saved.", flush=True)
+        if lora_output and mode_value == "moe":
+            expert_dirs = []
+            for idx, expert_map in enumerate(moe_tensors):
+                expert_dir = Path(lora_output) / f"expert_{idx}"
+                save_lora_adapter(expert_dir, expert_map, base_id, lora_targets, lora_rank)
+                expert_dirs.append(str(expert_dir))
+            config = {
+                "experts": expert_dirs,
+                "models": list(model_ids),
+                "router": "uniform",
+                "top_k": min(2, len(model_ids)),
+            }
+            (Path(lora_output) / "moe_config.json").write_text(json.dumps(config, indent=2))
+            if verbose:
+                print("MoE adapters saved.", flush=True)
         if report:
             print_conflict_report(conflict_stats)
         if not lora_only and quant and quant.lower() not in {"none", "fp16", "fp32"}:
@@ -765,6 +962,38 @@ def merge(
             quant_mod.quantize_model(output, tokenizer, quant)
             if verbose:
                 print("Quantization complete.", flush=True)
+        if quality_gate:
+            if mode_value == "merge":
+                ppl = evaluate_perplexity(
+                    output,
+                    ppl_dataset,
+                    ppl_config,
+                    ppl_split,
+                    ppl_samples,
+                    ppl_seq_len,
+                    device,
+                    compute_dtype,
+                )
+            else:
+                ppl = evaluate_lora_perplexity(
+                    str(base_dir),
+                    lora_output or str(output_dir),
+                    ppl_dataset,
+                    ppl_config,
+                    ppl_split,
+                    ppl_samples,
+                    ppl_seq_len,
+                    device,
+                    compute_dtype,
+                )
+            if verbose:
+                print(f"Perplexity: {ppl:.3f}", flush=True)
+            if ppl > ppl_threshold:
+                if not lora_only:
+                    for path in output_dir.glob("*"):
+                        if path.is_file():
+                            path.unlink()
+                raise ModelDimensionMismatchError("Perplexity gate failed")
     return output
 
 
@@ -793,3 +1022,4 @@ def print_conflict_report(conflict_stats: LayerScores) -> None:
     except Exception:
         for layer_id, value in items:
             print(f"{layer_id}: {value:.3f}")
+LayerFilter: TypeAlias = tuple[set[int] | None, re.Pattern[str] | None]

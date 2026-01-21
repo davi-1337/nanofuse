@@ -71,6 +71,15 @@ def test_lora_only_requires_output():
             mosaic_size=0,
             hadamard_keep=1.0,
             io_workers=1,
+            mode="lora",
+            layers=None,
+            quality_gate=False,
+            ppl_threshold=20.0,
+            ppl_samples=8,
+            ppl_seq_len=64,
+            ppl_dataset="wikitext",
+            ppl_config="wikitext-2-raw-v1",
+            ppl_split="test[:1%]",
             layer_map_path=None,
             preflight_threshold=0.1,
             shard_size_mb=1,
@@ -82,3 +91,9 @@ def test_lora_only_requires_output():
         )
     except Exception as exc:
         assert "LoRA output" in str(exc)
+
+
+def test_parse_layers_filter_ranges():
+    ranges, pattern = merger.parse_layers_filter("1-3,5")
+    assert pattern is None
+    assert ranges == {1, 2, 3, 5}
