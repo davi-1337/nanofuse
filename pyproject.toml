@@ -48,4 +48,4 @@ nanofuse = "cli:app"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["cli", "merger", "utils", "quant"]
+py-modules = ["cli", "merger", "utils", "quant", "errors"]

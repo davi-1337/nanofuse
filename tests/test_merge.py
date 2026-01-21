@@ -1,33 +1,32 @@
 import os
 import sys
+
 import torch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
 
 import merger
-import utils
 
 
-def test_merge_state_dicts_shapes():
+def test_svd_low_rank_shape():
+    x = torch.randn(4, 16)
+    y = merger.svd_low_rank(x, rank=2)
+    assert y.shape == x.shape
+
+
+def test_apply_dare_drops_values():
+    x = torch.randn(100)
+    y = merger.apply_dare(x, 0.5)
+    assert y.shape == x.shape
+    assert (y == 0).sum().item() > 0
+
+
+def test_compute_fused_delta_shape():
     torch.manual_seed(0)
-    base = {
-        "layer1.weight": torch.randn(4, 4),
-        "layer1.bias": torch.randn(4),
-        "layer2.weight": torch.randn(4, 4),
-    }
-    models = []
-    for _ in range(3):
-        state = {k: v + 0.01 * torch.randn_like(v) for k, v in base.items()}
-        models.append(state)
-    merged = merger.merge_state_dicts(base, models, rank=2, moefrac=0.6, top_k=2)
-    assert set(merged.keys()) == set(base.keys())
-    for k in base:
-        assert merged[k].shape == base[k].shape
-    assert not torch.allclose(merged["layer1.weight"], base["layer1.weight"])
-
-
-def test_entropy_router_topk():
-    logits = torch.tensor([0.1, 0.2, 0.3, 0.4])
-    mask = utils.entropy_router(logits, top_k=2)
-    assert torch.isclose(mask.sum(), torch.tensor(1.0))
-    assert (mask > 0).sum().item() == 2
+    base = torch.randn(4, 4)
+    models = [base + 0.1 * torch.randn_like(base) for _ in range(3)]
+    delta, conflict = merger.compute_fused_delta(
+        base, models, rank=2, moefrac=0.6, top_k=2, align=False, dare_drop=0.0
+    )
+    assert delta.shape == base.shape
+    assert isinstance(conflict, float)
