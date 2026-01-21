@@ -30,3 +30,35 @@ def test_compute_fused_delta_shape():
     )
     assert delta.shape == base.shape
     assert isinstance(conflict, float)
+
+
+def test_lora_only_requires_output():
+    try:
+        merger.merge(
+            base_id="dummy",
+            model_ids=["dummy"],
+            rank=8,
+            output="out",
+            quant="none",
+            moefrac=0.5,
+            device="cpu",
+            report=False,
+            preview=False,
+            preview_start=None,
+            preview_end=None,
+            dare_drop=0.0,
+            align=False,
+            lora_output=None,
+            lora_rank=8,
+            lora_only=True,
+            layer_map_path=None,
+            preflight_threshold=0.1,
+            shard_size_mb=1,
+            verbose=False,
+            safe_mode=True,
+            max_vram_gb=None,
+            max_ram_gb=None,
+            dtype="fp32",
+        )
+    except Exception as exc:
+        assert "LoRA output" in str(exc)

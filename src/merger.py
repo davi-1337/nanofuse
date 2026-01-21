@@ -384,6 +384,7 @@ def merge(
     align: bool,
     lora_output: str | None,
     lora_rank: int,
+    lora_only: bool,
     layer_map_path: str | None,
     preflight_threshold: float,
     shard_size_mb: int,
@@ -411,6 +412,8 @@ def merge(
         raise ModelDimensionMismatchError("LoRA rank must be positive")
     if shard_size_mb <= 0:
         raise ModelDimensionMismatchError("Shard size must be positive")
+    if lora_only and not lora_output:
+        raise ModelDimensionMismatchError("LoRA output is required for LoRA-only mode")
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     if dtype not in dtype_map:
         raise ModelDimensionMismatchError("Dtype must be bf16, fp16, or fp32")
@@ -429,7 +432,8 @@ def merge(
         if fraction > 0:
             torch.cuda.set_per_process_memory_fraction(fraction, 0)
     output_dir = Path(output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not lora_only:
+        output_dir.mkdir(parents=True, exist_ok=True)
     if verbose:
         print("Resolving base model...", flush=True)
     base_dir = utils.resolve_model_dir(base_id, verbose=verbose)
@@ -458,11 +462,12 @@ def merge(
         num_layers = int(getattr(config, "num_hidden_layers", 0))
         preview_range = utils.select_preview_layers(num_layers, preview, preview_start, preview_end)
         tokenizer, new_vocab_size = merge_tokenizers(base_dir, model_dirs)
-        config.vocab_size = new_vocab_size
-        config.save_pretrained(str(output_dir))
-        tokenizer.save_pretrained(str(output_dir))
+        if not lora_only:
+            config.vocab_size = new_vocab_size
+            config.save_pretrained(str(output_dir))
+            tokenizer.save_pretrained(str(output_dir))
         preflight_similarity(base, models, base_keys, device, preflight_threshold)
-        writer = ShardWriter(output_dir, max(1, shard_size_mb) * 1024 * 1024)
+        writer = None if lora_only else ShardWriter(output_dir, max(1, shard_size_mb) * 1024 * 1024)
         lora_tensors: dict[str, torch.Tensor] = {}
         lora_targets: set[str] = set()
         conflict_stats: LayerScores = {}
@@ -478,7 +483,8 @@ def merge(
             if base_tensor.dim() >= 2 and (is_embedding_key(key) or is_lm_head_key(key)):
                 base_tensor = resize_vocab(base_tensor, new_vocab_size)
             if not torch.is_floating_point(base_tensor):
-                writer.add(key, base_tensor)
+                if writer:
+                    writer.add(key, base_tensor)
                 continue
             layer_id = utils.extract_layer_id(key)
             if verbose and layer_id != last_layer:
@@ -487,7 +493,8 @@ def merge(
             layer_idx = utils.layer_number(layer_id)
             if preview_range and layer_idx is not None:
                 if layer_idx < preview_range[0] or layer_idx > preview_range[1]:
-                    writer.add(key, base_tensor)
+                    if writer:
+                        writer.add(key, base_tensor)
                     continue
             if layer_idx is not None and layer_idx in layer_map:
                 selected = [models[layer_map[layer_idx]]]
@@ -547,7 +554,8 @@ def merge(
                     torch.cuda.empty_cache()
             if merged is None or fused_delta is None:
                 raise ModelDimensionMismatchError("Fusion failed for tensor")
-            writer.add(key, merged)
+            if writer:
+                writer.add(key, merged)
             if report:
                 scores = conflict_stats.setdefault(layer_id, [])
                 scores.append(conflict)
@@ -561,16 +569,17 @@ def merge(
             del base_tensor, model_tensors, fused_delta, merged
             if verbose and idx % 50 == 0:
                 print(f"Merged {idx}/{total_keys} tensors", flush=True)
-        writer.finalize()
-        if verbose:
-            print("Weights saved.", flush=True)
+        if writer:
+            writer.finalize()
+            if verbose:
+                print("Weights saved.", flush=True)
         if lora_output:
             save_lora_adapter(Path(lora_output), lora_tensors, base_id, lora_targets, lora_rank)
             if verbose:
                 print("LoRA adapter saved.", flush=True)
         if report:
             print_conflict_report(conflict_stats)
-        if quant and quant.lower() not in {"none", "fp16", "fp32"}:
+        if not lora_only and quant and quant.lower() not in {"none", "fp16", "fp32"}:
             import quant as quant_mod
 
             quant_mod.quantize_model(output, tokenizer, quant)

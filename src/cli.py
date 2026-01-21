@@ -41,6 +41,7 @@ def merge(
     align: bool = typer.Option(False, "--align", help="Apply alignment"),
     lora_output: str | None = typer.Option(None, "--lora-output", help="LoRA output dir"),
     lora_rank: int = typer.Option(64, "--lora-rank", help="LoRA rank"),
+    lora_only: bool = typer.Option(False, "--lora-only", help="Generate LoRA only"),
     layer_map: str | None = typer.Option(None, "--layer-map", help="Layer map YAML"),
     preflight_threshold: float = typer.Option(
         0.1, "--preflight-threshold", help="Preflight similarity threshold"
@@ -71,6 +72,7 @@ def merge(
         align=align,
         lora_output=lora_output,
         lora_rank=lora_rank,
+        lora_only=lora_only,
         layer_map_path=layer_map,
         preflight_threshold=preflight_threshold,
         shard_size_mb=shard_size_mb,
