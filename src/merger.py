@@ -105,6 +105,35 @@ def svd_low_rank(stack: torch.Tensor, rank: int, niter: int = 2) -> torch.Tensor
     return (u * s) @ v.t()
 
 
+def svd_factors(
+    stack: torch.Tensor, rank: int, niter: int = 2
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if stack.dim() != 2:
+        raise ModelDimensionMismatchError("SVD expects a 2D tensor")
+    m, n = stack.shape
+    limit = min(m, n)
+    if limit <= 1:
+        raise ModelDimensionMismatchError("SVD requires at least 2 rows and columns")
+    q = min(rank, limit - 1)
+    if q <= 0:
+        raise ModelDimensionMismatchError("Rank too small for SVD")
+    return torch.svd_lowrank(stack, q=q, niter=niter)
+
+
+def select_rank(
+    s: torch.Tensor, energy_threshold: float, min_rank: int, max_rank: int
+) -> int:
+    if s.numel() == 0:
+        return min_rank
+    energy = s.pow(2)
+    total = energy.sum()
+    if total <= 0:
+        return min_rank
+    cumulative = torch.cumsum(energy, dim=0) / total
+    target = int((cumulative >= energy_threshold).nonzero(as_tuple=False)[0].item() + 1)
+    return max(min_rank, min(max_rank, target))
+
+
 def apply_dare(delta: torch.Tensor, drop_rate: float) -> torch.Tensor:
     if drop_rate <= 0:
         return delta
@@ -279,7 +308,11 @@ def compute_fused_delta(
     top_k: int,
     align: bool,
     dare_drop: float,
-) -> tuple[torch.Tensor, float]:
+    adaptive_rank: bool,
+    energy_threshold: float,
+    min_rank: int,
+    max_rank: int,
+) -> tuple[torch.Tensor, float, int]:
     deltas = []
     for tensor in model_tensors:
         if tensor.shape != base_tensor.shape:
@@ -288,13 +321,19 @@ def compute_fused_delta(
         delta = apply_dare(delta, dare_drop)
         deltas.append(delta.reshape(-1))
     stack = torch.stack(deltas)
-    low_rank = svd_low_rank(stack, rank)
+    if adaptive_rank:
+        u, s, v = svd_factors(stack, max_rank)
+        use_rank = select_rank(s, energy_threshold, min_rank, max_rank)
+        low_rank = (u[:, :use_rank] * s[:use_rank]) @ v[:use_rank].t()
+    else:
+        use_rank = rank
+        low_rank = svd_low_rank(stack, rank)
     aligned = align_vectors(low_rank) if align else low_rank
     weights = similarity_weights(aligned)
     masked = consensus_mask(low_rank, weights)
     moe = moe_fuse(low_rank, weights, top_k=min(top_k, low_rank.shape[0]))
     fused = moefrac * moe + (1.0 - moefrac) * masked
-    return fused.reshape(base_tensor.shape).to(base_tensor.dtype), conflict_score(stack)
+    return fused.reshape(base_tensor.shape).to(base_tensor.dtype), conflict_score(stack), use_rank
 
 
 def lora_keys(base_key: str) -> tuple[str, str]:
@@ -385,6 +424,10 @@ def merge(
     lora_output: str | None,
     lora_rank: int,
     lora_only: bool,
+    adaptive_rank: bool,
+    energy_threshold: float,
+    min_rank: int,
+    max_rank: int,
     layer_map_path: str | None,
     preflight_threshold: float,
     shard_size_mb: int,
@@ -414,6 +457,13 @@ def merge(
         raise ModelDimensionMismatchError("Shard size must be positive")
     if lora_only and not lora_output:
         raise ModelDimensionMismatchError("LoRA output is required for LoRA-only mode")
+    if adaptive_rank:
+        if min_rank <= 0 or max_rank <= 0:
+            raise ModelDimensionMismatchError("Adaptive ranks must be positive")
+        if min_rank > max_rank:
+            raise ModelDimensionMismatchError("Minimum rank must be <= maximum rank")
+        if energy_threshold <= 0 or energy_threshold > 1:
+            raise ModelDimensionMismatchError("Energy threshold must be between 0 and 1")
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     if dtype not in dtype_map:
         raise ModelDimensionMismatchError("Dtype must be bf16, fp16, or fp32")
@@ -512,8 +562,9 @@ def merge(
             fused_delta = None
             merged = None
             conflict = 0.0
+            used_rank = rank
             try:
-                fused_delta, conflict = compute_fused_delta(
+                fused_delta, conflict, used_rank = compute_fused_delta(
                     base_tensor,
                     model_tensors,
                     rank,
@@ -521,8 +572,13 @@ def merge(
                     4,
                     align,
                     dare_drop,
+                    adaptive_rank,
+                    energy_threshold,
+                    min_rank,
+                    max_rank,
                 )
-                merged = base_tensor + fused_delta
+                if writer:
+                    merged = base_tensor + fused_delta
             except RuntimeError as exc:
                 if device == "cuda" and "out of memory" in str(exc).lower():
                     torch.cuda.empty_cache()
@@ -537,7 +593,7 @@ def merge(
                         is_embedding_key(key) or is_lm_head_key(key)
                     ):
                         model_tensors = [resize_vocab(t, new_vocab_size) for t in model_tensors]
-                    fused_delta, conflict = compute_fused_delta(
+                    fused_delta, conflict, used_rank = compute_fused_delta(
                         base_tensor,
                         model_tensors,
                         rank,
@@ -545,22 +601,28 @@ def merge(
                         4,
                         align,
                         dare_drop,
+                        adaptive_rank,
+                        energy_threshold,
+                        min_rank,
+                        max_rank,
                     )
-                    merged = base_tensor + fused_delta
+                    if writer:
+                        merged = base_tensor + fused_delta
                 else:
                     raise
             finally:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            if merged is None or fused_delta is None:
+            if fused_delta is None:
                 raise ModelDimensionMismatchError("Fusion failed for tensor")
-            if writer:
+            if writer and merged is not None:
                 writer.add(key, merged)
             if report:
                 scores = conflict_stats.setdefault(layer_id, [])
                 scores.append(conflict)
-            if lora_output and merged.dim() == 2:
-                lora_a, lora_b = lora_decompose(fused_delta.float(), lora_rank)
+            if lora_output and base_tensor.dim() == 2:
+                lora_effective_rank = min(lora_rank, used_rank)
+                lora_a, lora_b = lora_decompose(fused_delta.float(), lora_effective_rank)
                 a_key, b_key = lora_keys(key)
                 lora_tensors[a_key] = lora_a.cpu()
                 lora_tensors[b_key] = lora_b.cpu()

@@ -25,11 +25,22 @@ def test_compute_fused_delta_shape():
     torch.manual_seed(0)
     base = torch.randn(4, 4)
     models = [base + 0.1 * torch.randn_like(base) for _ in range(3)]
-    delta, conflict = merger.compute_fused_delta(
-        base, models, rank=2, moefrac=0.6, top_k=2, align=False, dare_drop=0.0
+    delta, conflict, used_rank = merger.compute_fused_delta(
+        base,
+        models,
+        rank=2,
+        moefrac=0.6,
+        top_k=2,
+        align=False,
+        dare_drop=0.0,
+        adaptive_rank=False,
+        energy_threshold=0.95,
+        min_rank=1,
+        max_rank=2,
     )
     assert delta.shape == base.shape
     assert isinstance(conflict, float)
+    assert used_rank == 2
 
 
 def test_lora_only_requires_output():
@@ -51,6 +62,10 @@ def test_lora_only_requires_output():
             lora_output=None,
             lora_rank=8,
             lora_only=True,
+            adaptive_rank=False,
+            energy_threshold=0.95,
+            min_rank=1,
+            max_rank=8,
             layer_map_path=None,
             preflight_threshold=0.1,
             shard_size_mb=1,

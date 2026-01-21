@@ -42,6 +42,12 @@ def merge(
     lora_output: str | None = typer.Option(None, "--lora-output", help="LoRA output dir"),
     lora_rank: int = typer.Option(64, "--lora-rank", help="LoRA rank"),
     lora_only: bool = typer.Option(False, "--lora-only", help="Generate LoRA only"),
+    adaptive_rank: bool = typer.Option(False, "--adaptive-rank", help="Auto rank per layer"),
+    energy_threshold: float = typer.Option(
+        0.95, "--energy-threshold", help="Spectral energy target"
+    ),
+    min_rank: int = typer.Option(8, "--min-rank", help="Minimum adaptive rank"),
+    max_rank: int = typer.Option(128, "--max-rank", help="Maximum adaptive rank"),
     layer_map: str | None = typer.Option(None, "--layer-map", help="Layer map YAML"),
     preflight_threshold: float = typer.Option(
         0.1, "--preflight-threshold", help="Preflight similarity threshold"
@@ -73,6 +79,10 @@ def merge(
         lora_output=lora_output,
         lora_rank=lora_rank,
         lora_only=lora_only,
+        adaptive_rank=adaptive_rank,
+        energy_threshold=energy_threshold,
+        min_rank=min_rank,
+        max_rank=max_rank,
         layer_map_path=layer_map,
         preflight_threshold=preflight_threshold,
         shard_size_mb=shard_size_mb,
