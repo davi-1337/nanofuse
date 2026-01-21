@@ -213,6 +213,8 @@ def select_rank(
 ) -> int:
     if s.numel() == 0:
         return min_rank
+    max_rank = min(max_rank, s.numel())
+    min_rank = min(min_rank, max_rank)
     energy = s.pow(2)
     total = energy.sum()
     if total <= 0:
@@ -414,7 +416,7 @@ def compute_fused_delta(
     if adaptive_rank:
         u, s, v = svd_factors(stack, max_rank)
         use_rank = select_rank(s, energy_threshold, min_rank, max_rank)
-        low_rank = (u[:, :use_rank] * s[:use_rank]) @ v[:use_rank].t()
+        low_rank = (u[:, :use_rank] * s[:use_rank]) @ v[:, :use_rank].t()
     else:
         use_rank = rank
         if mosaic_size > 0 or hadamard_keep < 1.0:
