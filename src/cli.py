@@ -23,6 +23,7 @@ def merge(
     moefrac: float = typer.Option(0.6, "--moefrac", help="MoE blend fraction"),
     device: str = typer.Option("auto", "--device", help="Device: auto, cpu, cuda"),
     report: bool = typer.Option(False, "--report", help="Show conflict report"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     preview: bool = typer.Option(False, "--preview", help="Merge preview layers only"),
     preview_start: int | None = typer.Option(
         None, "--preview-start", help="Preview start layer"
@@ -54,7 +55,7 @@ def merge(
         quant=quant,
         moefrac=moefrac,
         device=device,
-        report=report,
+        report=report or verbose,
         preview=preview,
         preview_start=preview_start,
         preview_end=preview_end,
