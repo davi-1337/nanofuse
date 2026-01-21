@@ -1,0 +1,16 @@
+base: meta-llama/Llama-3-8B
+models:
+  - mistral-7b-code
+  - qwen2-7b-math
+  - model3
+  - model4
+  - model5
+  - model6
+  - model7
+  - model8
+  - model9
+  - model10
+rank: 128
+moefrac: 0.6
+output: nanofuse-super7b
+quant: q4

@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanofuse"
+version = "0.1.0"
+description = "Fast low-rank LLM merger"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "pytorch",
+  "torchvision",
+  "torchaudio",
+  "pytorch-cuda==12.1",
+  "transformers",
+  "accelerate",
+  "safetensors",
+  "datasets",
+  "peft",
+  "bitsandbytes",
+  "auto-gptq",
+  "optimum[exporters]",
+  "mergekit",
+  "umap-learn",
+  "scikit-learn",
+  "scipy",
+  "numpy",
+  "pandas",
+  "wandb",
+  "tensorboard",
+  "tqdm",
+  "rich",
+  "typer",
+  "click",
+  "hydra-core",
+  "einops",
+  "xformers",
+  "flash-attn",
+  "loguru",
+  "pyyaml",
+  "sentencepiece",
+  "protobuf"
+]
+
+[project.scripts]
+nanofuse = "cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["cli", "merger", "utils", "quant"]
