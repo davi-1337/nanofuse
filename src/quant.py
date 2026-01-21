@@ -56,6 +56,13 @@ def _calib_samples(
 
 def _prepare_transformers_env() -> None:
     os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
+    try:
+        from transformers.utils import import_utils
+
+        import_utils._torchvision_available = False
+        import_utils._torchvision_version = "N/A"
+    except Exception:
+        return
 
 
 def quantize_gptq(
