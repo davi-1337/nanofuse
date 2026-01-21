@@ -20,3 +20,7 @@ class QuantizationError(NanoFuseError):
 
 class TokenizerError(NanoFuseError):
     pass
+
+
+class OOMError(NanoFuseError):
+    pass

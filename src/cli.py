@@ -48,6 +48,11 @@ def merge(
     ),
     min_rank: int = typer.Option(8, "--min-rank", help="Minimum adaptive rank"),
     max_rank: int = typer.Option(128, "--max-rank", help="Maximum adaptive rank"),
+    mosaic_size: int = typer.Option(0, "--mosaic-size", help="Mosaic block size"),
+    hadamard_keep: float = typer.Option(
+        1.0, "--hadamard-keep", help="Hadamard low-pass keep ratio"
+    ),
+    io_workers: int = typer.Option(4, "--io-workers", help="I/O worker threads"),
     layer_map: str | None = typer.Option(None, "--layer-map", help="Layer map YAML"),
     preflight_threshold: float = typer.Option(
         0.1, "--preflight-threshold", help="Preflight similarity threshold"
@@ -83,6 +88,9 @@ def merge(
         energy_threshold=energy_threshold,
         min_rank=min_rank,
         max_rank=max_rank,
+        mosaic_size=mosaic_size,
+        hadamard_keep=hadamard_keep,
+        io_workers=io_workers,
         layer_map_path=layer_map,
         preflight_threshold=preflight_threshold,
         shard_size_mb=shard_size_mb,

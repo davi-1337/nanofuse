@@ -37,6 +37,8 @@ def test_compute_fused_delta_shape():
         energy_threshold=0.95,
         min_rank=1,
         max_rank=2,
+        mosaic_size=0,
+        hadamard_keep=1.0,
     )
     assert delta.shape == base.shape
     assert isinstance(conflict, float)
@@ -66,6 +68,9 @@ def test_lora_only_requires_output():
             energy_threshold=0.95,
             min_rank=1,
             max_rank=8,
+            mosaic_size=0,
+            hadamard_keep=1.0,
+            io_workers=1,
             layer_map_path=None,
             preflight_threshold=0.1,
             shard_size_mb=1,

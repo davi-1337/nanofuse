@@ -4,13 +4,19 @@ import json
 import subprocess
 import sys
 from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Sequence, TypeAlias
+from typing import Callable, Sequence, TypeAlias, TypeVar
 
 import torch
 
 import utils
-from errors import ModelDimensionMismatchError, ModelFileNotFoundError, TensorShapeMismatchError
+from errors import (
+    ModelDimensionMismatchError,
+    ModelFileNotFoundError,
+    OOMError,
+    TensorShapeMismatchError,
+)
 
 LayerScores: TypeAlias = dict[str, list[float]]
 LayerMap: TypeAlias = dict[int, int]
@@ -118,6 +124,88 @@ def svd_factors(
     if q <= 0:
         raise ModelDimensionMismatchError("Rank too small for SVD")
     return torch.svd_lowrank(stack, q=q, niter=niter)
+
+
+T = TypeVar("T")
+
+
+def compile_kernel(fn: Callable[..., T]) -> Callable[..., T]:
+    try:
+        return torch.compile(fn, mode="reduce-overhead")
+    except Exception:
+        return fn
+
+
+def next_power_of_two(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
+def pad_to_power_of_two(x: torch.Tensor) -> tuple[torch.Tensor, int]:
+    size = x.shape[-1]
+    target = next_power_of_two(size)
+    if target == size:
+        return x, size
+    pad_size = target - size
+    pad = torch.zeros(*x.shape[:-1], pad_size, device=x.device, dtype=x.dtype)
+    return torch.cat([x, pad], dim=-1), size
+
+
+def fwht(x: torch.Tensor) -> torch.Tensor:
+    n = x.shape[-1]
+    h = x
+    step = 1
+    while step < n:
+        h = h.view(*h.shape[:-1], -1, step * 2)
+        a = h[..., :step]
+        b = h[..., step : step * 2]
+        h = torch.cat([a + b, a - b], dim=-1)
+        step *= 2
+    return h.view(*x.shape)
+
+
+def hadamard_low_pass(x: torch.Tensor, keep_ratio: float) -> torch.Tensor:
+    if keep_ratio >= 1.0:
+        return x
+    if keep_ratio <= 0.0:
+        return torch.zeros_like(x)
+    padded, original = pad_to_power_of_two(x)
+    transformed = fwht(padded)
+    n = transformed.shape[-1]
+    keep = max(1, int(n * keep_ratio))
+    mask = torch.zeros(n, device=transformed.device, dtype=transformed.dtype)
+    mask[:keep] = 1.0
+    filtered = transformed * mask
+    recovered = fwht(filtered) / n
+    return recovered[..., :original]
+
+
+hadamard_low_pass = compile_kernel(hadamard_low_pass)
+
+
+def low_rank_mosaic(
+    stack: torch.Tensor,
+    rank: int,
+    chunk_size: int,
+    hadamard_keep: float,
+) -> torch.Tensor:
+    if stack.dim() != 2:
+        raise ModelDimensionMismatchError("Mosaic expects a 2D tensor")
+    if chunk_size <= 0:
+        return svd_low_rank(stack, rank)
+    chunks = []
+    for start in range(0, stack.shape[1], chunk_size):
+        end = min(start + chunk_size, stack.shape[1])
+        chunk = stack[:, start:end]
+        if hadamard_keep < 1.0:
+            chunk = hadamard_low_pass(chunk, hadamard_keep)
+        chunk = svd_low_rank(chunk, rank)
+        chunks.append(chunk)
+    return torch.cat(chunks, dim=1)
+
+
+low_rank_mosaic = compile_kernel(low_rank_mosaic)
 
 
 def select_rank(
@@ -312,6 +400,8 @@ def compute_fused_delta(
     energy_threshold: float,
     min_rank: int,
     max_rank: int,
+    mosaic_size: int,
+    hadamard_keep: float,
 ) -> tuple[torch.Tensor, float, int]:
     deltas = []
     for tensor in model_tensors:
@@ -327,7 +417,10 @@ def compute_fused_delta(
         low_rank = (u[:, :use_rank] * s[:use_rank]) @ v[:use_rank].t()
     else:
         use_rank = rank
-        low_rank = svd_low_rank(stack, rank)
+        if mosaic_size > 0 or hadamard_keep < 1.0:
+            low_rank = low_rank_mosaic(stack, rank, mosaic_size, hadamard_keep)
+        else:
+            low_rank = svd_low_rank(stack, rank)
     aligned = align_vectors(low_rank) if align else low_rank
     weights = similarity_weights(aligned)
     masked = consensus_mask(low_rank, weights)
@@ -428,6 +521,9 @@ def merge(
     energy_threshold: float,
     min_rank: int,
     max_rank: int,
+    mosaic_size: int,
+    hadamard_keep: float,
+    io_workers: int,
     layer_map_path: str | None,
     preflight_threshold: float,
     shard_size_mb: int,
@@ -464,6 +560,12 @@ def merge(
             raise ModelDimensionMismatchError("Minimum rank must be <= maximum rank")
         if energy_threshold <= 0 or energy_threshold > 1:
             raise ModelDimensionMismatchError("Energy threshold must be between 0 and 1")
+    if mosaic_size < 0:
+        raise ModelDimensionMismatchError("Mosaic size must be >= 0")
+    if hadamard_keep <= 0 or hadamard_keep > 1:
+        raise ModelDimensionMismatchError("Hadamard keep ratio must be between 0 and 1")
+    if io_workers <= 0:
+        raise ModelDimensionMismatchError("I/O workers must be positive")
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     if dtype not in dtype_map:
         raise ModelDimensionMismatchError("Dtype must be bf16, fp16, or fp32")
@@ -526,73 +628,50 @@ def merge(
             print(f"Merging {total_keys} tensors...", flush=True)
         last_layer = None
         compute_dtype = dtype_map[dtype]
-        for idx, key in enumerate(base_keys, start=1):
-            base_tensor = base.get_tensor(key, device)
-            if base_tensor.dtype != compute_dtype and torch.is_floating_point(base_tensor):
-                base_tensor = base_tensor.to(compute_dtype)
-            if base_tensor.dim() >= 2 and (is_embedding_key(key) or is_lm_head_key(key)):
-                base_tensor = resize_vocab(base_tensor, new_vocab_size)
-            if not torch.is_floating_point(base_tensor):
-                if writer:
-                    writer.add(key, base_tensor)
-                continue
-            layer_id = utils.extract_layer_id(key)
-            if verbose and layer_id != last_layer:
-                print(f"Processing {layer_id}", flush=True)
-                last_layer = layer_id
-            layer_idx = utils.layer_number(layer_id)
-            if preview_range and layer_idx is not None:
-                if layer_idx < preview_range[0] or layer_idx > preview_range[1]:
+        executor = ThreadPoolExecutor(max_workers=io_workers)
+        try:
+            for idx, key in enumerate(base_keys, start=1):
+                base_tensor = base.get_tensor(key, device)
+                if base_tensor.dtype != compute_dtype and torch.is_floating_point(base_tensor):
+                    base_tensor = base_tensor.to(compute_dtype)
+                if base_tensor.dim() >= 2 and (is_embedding_key(key) or is_lm_head_key(key)):
+                    base_tensor = resize_vocab(base_tensor, new_vocab_size)
+                if not torch.is_floating_point(base_tensor):
                     if writer:
                         writer.add(key, base_tensor)
                     continue
-            if layer_idx is not None and layer_idx in layer_map:
-                selected = [models[layer_map[layer_idx]]]
-            else:
-                selected = models
-            model_tensors = [m.get_tensor(key, device) for m in selected]
-            model_tensors = [
-                t.to(compute_dtype)
-                if torch.is_floating_point(t) and t.dtype != compute_dtype
-                else t
-                for t in model_tensors
-            ]
-            if base_tensor.dim() >= 2 and (is_embedding_key(key) or is_lm_head_key(key)):
-                model_tensors = [resize_vocab(t, new_vocab_size) for t in model_tensors]
-            fused_delta = None
-            merged = None
-            conflict = 0.0
-            used_rank = rank
-            try:
-                fused_delta, conflict, used_rank = compute_fused_delta(
-                    base_tensor,
-                    model_tensors,
-                    rank,
-                    moefrac,
-                    4,
-                    align,
-                    dare_drop,
-                    adaptive_rank,
-                    energy_threshold,
-                    min_rank,
-                    max_rank,
+                layer_id = utils.extract_layer_id(key)
+                if verbose and layer_id != last_layer:
+                    print(f"Processing {layer_id}", flush=True)
+                    last_layer = layer_id
+                layer_idx = utils.layer_number(layer_id)
+                if preview_range and layer_idx is not None:
+                    if layer_idx < preview_range[0] or layer_idx > preview_range[1]:
+                        if writer:
+                            writer.add(key, base_tensor)
+                        continue
+                if layer_idx is not None and layer_idx in layer_map:
+                    selected = [models[layer_map[layer_idx]]]
+                else:
+                    selected = models
+                model_tensors = list(
+                    executor.map(lambda m: m.get_tensor(key, device), selected)
                 )
-                if writer:
-                    merged = base_tensor + fused_delta
-            except RuntimeError as exc:
-                if device == "cuda" and "out of memory" in str(exc).lower():
-                    torch.cuda.empty_cache()
-                    device = "cpu"
-                    base_tensor = base.get_tensor(key, device)
-                    if base_tensor.dim() >= 2 and (
-                        is_embedding_key(key) or is_lm_head_key(key)
-                    ):
-                        base_tensor = resize_vocab(base_tensor, new_vocab_size)
-                    model_tensors = [m.get_tensor(key, device) for m in selected]
-                    if base_tensor.dim() >= 2 and (
-                        is_embedding_key(key) or is_lm_head_key(key)
-                    ):
-                        model_tensors = [resize_vocab(t, new_vocab_size) for t in model_tensors]
+                model_tensors = [
+                    t.to(compute_dtype)
+                    if torch.is_floating_point(t) and t.dtype != compute_dtype
+                    else t
+                    for t in model_tensors
+                ]
+                if base_tensor.dim() >= 2 and (
+                    is_embedding_key(key) or is_lm_head_key(key)
+                ):
+                    model_tensors = [resize_vocab(t, new_vocab_size) for t in model_tensors]
+                fused_delta = None
+                merged = None
+                conflict = 0.0
+                used_rank = rank
+                try:
                     fused_delta, conflict, used_rank = compute_fused_delta(
                         base_tensor,
                         model_tensors,
@@ -605,32 +684,69 @@ def merge(
                         energy_threshold,
                         min_rank,
                         max_rank,
+                        mosaic_size,
+                        hadamard_keep,
                     )
                     if writer:
                         merged = base_tensor + fused_delta
-                else:
-                    raise
-            finally:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            if fused_delta is None:
-                raise ModelDimensionMismatchError("Fusion failed for tensor")
-            if writer and merged is not None:
-                writer.add(key, merged)
-            if report:
-                scores = conflict_stats.setdefault(layer_id, [])
-                scores.append(conflict)
-            if lora_output and base_tensor.dim() == 2:
-                lora_effective_rank = min(lora_rank, used_rank)
-                lora_a, lora_b = lora_decompose(fused_delta.float(), lora_effective_rank)
-                a_key, b_key = lora_keys(key)
-                lora_tensors[a_key] = lora_a.cpu()
-                lora_tensors[b_key] = lora_b.cpu()
-                module_name = key.split(".")[-2]
-                lora_targets.add(module_name)
-            del base_tensor, model_tensors, fused_delta, merged
-            if verbose and idx % 50 == 0:
-                print(f"Merged {idx}/{total_keys} tensors", flush=True)
+                except RuntimeError as exc:
+                    if device == "cuda" and "out of memory" in str(exc).lower():
+                        torch.cuda.empty_cache()
+                        device = "cpu"
+                        base_tensor = base.get_tensor(key, device)
+                        if base_tensor.dim() >= 2 and (
+                            is_embedding_key(key) or is_lm_head_key(key)
+                        ):
+                            base_tensor = resize_vocab(base_tensor, new_vocab_size)
+                        model_tensors = [m.get_tensor(key, device) for m in selected]
+                        if base_tensor.dim() >= 2 and (
+                            is_embedding_key(key) or is_lm_head_key(key)
+                        ):
+                            model_tensors = [
+                                resize_vocab(t, new_vocab_size) for t in model_tensors
+                            ]
+                        fused_delta, conflict, used_rank = compute_fused_delta(
+                            base_tensor,
+                            model_tensors,
+                            rank,
+                            moefrac,
+                            4,
+                            align,
+                            dare_drop,
+                            adaptive_rank,
+                            energy_threshold,
+                            min_rank,
+                            max_rank,
+                            mosaic_size,
+                            hadamard_keep,
+                        )
+                        if writer:
+                            merged = base_tensor + fused_delta
+                    else:
+                        raise
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                if fused_delta is None:
+                    raise ModelDimensionMismatchError("Fusion failed for tensor")
+                if writer and merged is not None:
+                    writer.add(key, merged)
+                if report:
+                    scores = conflict_stats.setdefault(layer_id, [])
+                    scores.append(conflict)
+                if lora_output and base_tensor.dim() == 2:
+                    lora_effective_rank = min(lora_rank, used_rank)
+                    lora_a, lora_b = lora_decompose(fused_delta.float(), lora_effective_rank)
+                    a_key, b_key = lora_keys(key)
+                    lora_tensors[a_key] = lora_a.cpu()
+                    lora_tensors[b_key] = lora_b.cpu()
+                    module_name = key.split(".")[-2]
+                    lora_targets.add(module_name)
+                del base_tensor, model_tensors, fused_delta, merged
+                if verbose and idx % 50 == 0:
+                    print(f"Merged {idx}/{total_keys} tensors", flush=True)
+        finally:
+            executor.shutdown(wait=True)
         if writer:
             writer.finalize()
             if verbose:
