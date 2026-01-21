@@ -1,0 +1,17 @@
+base: meta-llama/Llama-3-8B
+models:
+  - Qwen/Qwen2.5-7B-Instruct
+  - mistralai/Mistral-7B-Instruct-v0.3
+rank: 128
+moefrac: 0.6
+output: outputs/nanofuse-reasoning-7b
+quant: q4
+dare_drop: 0.5
+align: false
+report: true
+preflight_threshold: 0.1
+preview: false
+lora_output: outputs/nanofuse-reasoning-7b-lora
+lora_rank: 64
+shard_size_mb: 512
+benchmark_tasks: hellaswag,arc_easy,piqa,winogrande
