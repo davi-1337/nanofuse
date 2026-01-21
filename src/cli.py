@@ -24,6 +24,14 @@ def merge(
     device: str = typer.Option("auto", "--device", help="Device: auto, cpu, cuda"),
     report: bool = typer.Option(False, "--report", help="Show conflict report"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    safe_mode: bool = typer.Option(False, "--safe-mode", help="Low memory mode"),
+    max_vram_gb: float | None = typer.Option(
+        None, "--max-vram-gb", help="VRAM budget in GB"
+    ),
+    max_ram_gb: float | None = typer.Option(
+        None, "--max-ram-gb", help="RAM budget in GB"
+    ),
+    dtype: str = typer.Option("bf16", "--dtype", help="bf16, fp16, fp32"),
     preview: bool = typer.Option(False, "--preview", help="Merge preview layers only"),
     preview_start: int | None = typer.Option(
         None, "--preview-start", help="Preview start layer"
@@ -67,6 +75,10 @@ def merge(
         preflight_threshold=preflight_threshold,
         shard_size_mb=shard_size_mb,
         verbose=verbose,
+        safe_mode=safe_mode,
+        max_vram_gb=max_vram_gb,
+        max_ram_gb=max_ram_gb,
+        dtype=dtype,
     )
 
 

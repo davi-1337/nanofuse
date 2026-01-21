@@ -388,6 +388,10 @@ def merge(
     preflight_threshold: float,
     shard_size_mb: int,
     verbose: bool,
+    safe_mode: bool,
+    max_vram_gb: float | None,
+    max_ram_gb: float | None,
+    dtype: str,
 ) -> str:
     if rank <= 0:
         raise ModelDimensionMismatchError("Rank must be positive")
@@ -407,6 +411,23 @@ def merge(
         raise ModelDimensionMismatchError("LoRA rank must be positive")
     if shard_size_mb <= 0:
         raise ModelDimensionMismatchError("Shard size must be positive")
+    dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
+    if dtype not in dtype_map:
+        raise ModelDimensionMismatchError("Dtype must be bf16, fp16, or fp32")
+    if safe_mode:
+        device = "cpu"
+        rank = min(rank, 32)
+        if quant.lower() not in {"none", "fp16", "fp32"}:
+            quant = "none"
+    if max_vram_gb is not None and max_vram_gb <= 5:
+        device = "cpu"
+    if max_ram_gb is not None and max_ram_gb <= 8:
+        torch.set_num_threads(1)
+    if device == "cuda" and max_vram_gb is not None:
+        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        fraction = min(0.95, max_vram_gb / total_gb)
+        if fraction > 0:
+            torch.cuda.set_per_process_memory_fraction(fraction, 0)
     output_dir = Path(output)
     output_dir.mkdir(parents=True, exist_ok=True)
     if verbose:
@@ -449,8 +470,11 @@ def merge(
         if verbose:
             print(f"Merging {total_keys} tensors...", flush=True)
         last_layer = None
+        compute_dtype = dtype_map[dtype]
         for idx, key in enumerate(base_keys, start=1):
             base_tensor = base.get_tensor(key, device)
+            if base_tensor.dtype != compute_dtype and torch.is_floating_point(base_tensor):
+                base_tensor = base_tensor.to(compute_dtype)
             if base_tensor.dim() >= 2 and (is_embedding_key(key) or is_lm_head_key(key)):
                 base_tensor = resize_vocab(base_tensor, new_vocab_size)
             if not torch.is_floating_point(base_tensor):
@@ -470,6 +494,12 @@ def merge(
             else:
                 selected = models
             model_tensors = [m.get_tensor(key, device) for m in selected]
+            model_tensors = [
+                t.to(compute_dtype)
+                if torch.is_floating_point(t) and t.dtype != compute_dtype
+                else t
+                for t in model_tensors
+            ]
             if base_tensor.dim() >= 2 and (is_embedding_key(key) or is_lm_head_key(key)):
                 model_tensors = [resize_vocab(t, new_vocab_size) for t in model_tensors]
             fused_delta = None
