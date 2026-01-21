@@ -5,3 +5,4 @@ wandb/
 outputs/
 conda-envs/
 .pytest_cache/
+nanofuse.egg-info/
