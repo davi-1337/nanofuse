@@ -66,6 +66,7 @@ def merge(
         layer_map_path=layer_map,
         preflight_threshold=preflight_threshold,
         shard_size_mb=shard_size_mb,
+        verbose=verbose,
     )
 
 

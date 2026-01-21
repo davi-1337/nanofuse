@@ -377,6 +377,7 @@ def merge(
     layer_map_path: str | None,
     preflight_threshold: float,
     shard_size_mb: int,
+    verbose: bool,
 ) -> str:
     if rank <= 0:
         raise ModelDimensionMismatchError("Rank must be positive")
@@ -398,10 +399,18 @@ def merge(
         raise ModelDimensionMismatchError("Shard size must be positive")
     output_dir = Path(output)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if verbose:
+        print("Resolving base model...", flush=True)
     base_dir = utils.resolve_model_dir(base_id)
-    model_dirs = [utils.resolve_model_dir(mid) for mid in model_ids]
+    model_dirs = []
+    for mid in model_ids:
+        if verbose:
+            print(f"Resolving merge model: {mid}", flush=True)
+        model_dirs.append(utils.resolve_model_dir(mid))
     layer_map = parse_layer_map(layer_map_path, model_ids)
     with ExitStack() as stack:
+        if verbose:
+            print("Opening safetensors handles...", flush=True)
         base = ModelAccess(base_dir, stack)
         models = [ModelAccess(model_dir, stack) for model_dir in model_dirs]
         base_keys = base.keys()
@@ -412,6 +421,8 @@ def merge(
                 raise ModelDimensionMismatchError("Model tensors do not match base")
         from transformers import AutoConfig
 
+        if verbose:
+            print("Loading config and tokenizer...", flush=True)
         config = AutoConfig.from_pretrained(str(base_dir))
         num_layers = int(getattr(config, "num_hidden_layers", 0))
         preview_range = utils.select_preview_layers(num_layers, preview, preview_start, preview_end)
@@ -424,7 +435,11 @@ def merge(
         lora_tensors: dict[str, torch.Tensor] = {}
         lora_targets: set[str] = set()
         conflict_stats: LayerScores = {}
-        for key in base_keys:
+        total_keys = len(base_keys)
+        if verbose:
+            print(f"Merging {total_keys} tensors...", flush=True)
+        last_layer = None
+        for idx, key in enumerate(base_keys, start=1):
             base_tensor = base.get_tensor(key, device)
             if base_tensor.dim() >= 2 and (is_embedding_key(key) or is_lm_head_key(key)):
                 base_tensor = resize_vocab(base_tensor, new_vocab_size)
@@ -432,6 +447,9 @@ def merge(
                 writer.add(key, base_tensor)
                 continue
             layer_id = utils.extract_layer_id(key)
+            if verbose and layer_id != last_layer:
+                print(f"Processing {layer_id}", flush=True)
+                last_layer = layer_id
             layer_idx = utils.layer_number(layer_id)
             if preview_range and layer_idx is not None:
                 if layer_idx < preview_range[0] or layer_idx > preview_range[1]:
@@ -501,15 +519,23 @@ def merge(
                 module_name = key.split(".")[-2]
                 lora_targets.add(module_name)
             del base_tensor, model_tensors, fused_delta, merged
+            if verbose and idx % 50 == 0:
+                print(f"Merged {idx}/{total_keys} tensors", flush=True)
         writer.finalize()
+        if verbose:
+            print("Weights saved.", flush=True)
         if lora_output:
             save_lora_adapter(Path(lora_output), lora_tensors, base_id, lora_targets, lora_rank)
+            if verbose:
+                print("LoRA adapter saved.", flush=True)
         if report:
             print_conflict_report(conflict_stats)
         if quant and quant.lower() not in {"none", "fp16", "fp32"}:
             import quant as quant_mod
 
             quant_mod.quantize_model(output, tokenizer, quant)
+            if verbose:
+                print("Quantization complete.", flush=True)
     return output
 
 
