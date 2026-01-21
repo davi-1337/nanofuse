@@ -12,13 +12,21 @@ from errors import ModelFileNotFoundError
 TensorIndex: TypeAlias = dict[str, Path]
 
 
-def resolve_model_dir(model_id: str, cache_dir: str | None = None) -> Path:
+def resolve_model_dir(
+    model_id: str, cache_dir: str | None = None, verbose: bool = False
+) -> Path:
     path = Path(model_id)
     if path.exists():
         return path
     from huggingface_hub import snapshot_download
 
-    local_dir = snapshot_download(model_id, cache_dir=cache_dir)
+    tqdm_class = None
+    if verbose:
+        from tqdm import tqdm
+
+        tqdm_class = tqdm
+        print(f"Downloading model: {model_id}", flush=True)
+    local_dir = snapshot_download(model_id, cache_dir=cache_dir, tqdm_class=tqdm_class)
     return Path(local_dir)
 
 

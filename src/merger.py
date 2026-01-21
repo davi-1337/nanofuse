@@ -401,12 +401,12 @@ def merge(
     output_dir.mkdir(parents=True, exist_ok=True)
     if verbose:
         print("Resolving base model...", flush=True)
-    base_dir = utils.resolve_model_dir(base_id)
+    base_dir = utils.resolve_model_dir(base_id, verbose=verbose)
     model_dirs = []
     for mid in model_ids:
         if verbose:
             print(f"Resolving merge model: {mid}", flush=True)
-        model_dirs.append(utils.resolve_model_dir(mid))
+        model_dirs.append(utils.resolve_model_dir(mid, verbose=verbose))
     layer_map = parse_layer_map(layer_map_path, model_ids)
     with ExitStack() as stack:
         if verbose:
